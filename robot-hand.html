@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ur">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Hand Writer</title>
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@600&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#0d1b2a; --dot:#1b2f45; --accent:#35e0ff; --panel:rgba(13,27,42,.82); }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; background:var(--bg); color:#dbe7f3;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { background-image:radial-gradient(var(--dot) 1.2px, transparent 1.2px); background-size:26px 26px; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; }
+  #ink { touch-action:none; cursor:crosshair; }
+  #hand { pointer-events:none; }
+  .hint { position:fixed; top:14px; left:50%; transform:translateX(-50%); max-width:92vw;
+    padding:8px 16px; border-radius:999px; background:var(--panel); border:1px solid #284866;
+    font-size:14px; text-align:center; z-index:3; }
+  .bar { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); width:min(720px, 94vw);
+    display:flex; gap:10px; align-items:center; padding:10px; border-radius:18px; z-index:4;
+    background:var(--panel); border:1px solid #284866; backdrop-filter:blur(8px); }
+  .bar input { flex:1; min-width:0; padding:11px 14px; border-radius:12px; border:1px solid #33567a;
+    background:#0a1522; color:#fff; font-size:16px; }
+  .bar input:focus-visible, .bar button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .bar button { cursor:pointer; border:0; border-radius:12px; padding:11px 16px; font-size:15px; font-weight:600; }
+  #go { background:var(--accent); color:#04222b; }
+  #go:disabled { opacity:.5; cursor:wait; }
+  #clr { background:#1c3550; color:#dbe7f3; }
+  .sw { display:flex; gap:6px; }
+  .sw button { width:24px; height:24px; padding:0; border-radius:50%; border:2px solid transparent; }
+  .sw button.on { border-color:#fff; }
+  @media (max-width:560px){ .sw{display:none;} }
+</style>
+</head>
+<body>
+<canvas id="ink"></canvas>
+<canvas id="hand"></canvas>
+
+<!-- <div class="hint">Screen par click karo, neeche likho aur Enter dabao. Ya mouse/ungli se drag karke draw karo.</div> -->
+
+<div class="bar">
+  <input id="txt" type="text" placeholder="Yahan likho..." autocomplete="off">
+  <div class="sw" id="sw"></div>
+  <button id="go">Write</button>
+  <button id="clr">Remove</button>
+</div>
+
+<script>
+const ink = document.getElementById('ink'), hand = document.getElementById('hand');
+const ictx = ink.getContext('2d'), hctx = hand.getContext('2d');
+const txt = document.getElementById('txt'), go = document.getElementById('go');
+const ACCENT = '#35e0ff';
+let W, H, DPR;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  const tmp = document.createElement('canvas');
+  tmp.width = ink.width; tmp.height = ink.height;
+  tmp.getContext('2d').drawImage(ink, 0, 0);
+  for (const c of [ink, hand]) { c.width = W * DPR; c.height = H * DPR; }
+  ictx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  hctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ictx.drawImage(tmp, 0, 0, tmp.width / DPR, tmp.height / DPR);
+}
+resize();
+addEventListener('resize', resize);
+
+/* ---------- state ---------- */
+let tip = { x: W * 0.55, y: H * 0.45 };
+let target = { ...tip };
+let penDown = false, busy = false, ang = 0.75, textPos = null, color = '#f4f1ea';
+
+/* ---------- colour swatches ---------- */
+const sw = document.getElementById('sw');
+['#f4f1ea', '#35e0ff', '#ffd166', '#ff7b9c', '#8dff9e'].forEach((c, i) => {
+  const b = document.createElement('button');
+  b.style.background = c; b.title = 'Rang'; if (i === 0) b.className = 'on';
+  b.onclick = () => { color = c; [...sw.children].forEach(x => x.classList.remove('on')); b.classList.add('on'); };
+  sw.appendChild(b);
+});
+
+/* ---------- ink + animation loop ---------- */
+function inkLine(x0, y0, x1, y1) {
+  if (Math.hypot(x1 - x0, y1 - y0) < 0.2) return;
+  ictx.save();
+  ictx.strokeStyle = color; ictx.lineWidth = 4; ictx.lineCap = 'round';
+  ictx.shadowColor = color; ictx.shadowBlur = 6;
+  ictx.beginPath(); ictx.moveTo(x0, y0); ictx.lineTo(x1, y1); ictx.stroke();
+  ictx.restore();
+}
+
+function tick(ms) {
+  const t = ms / 1000;
+  const px = tip.x, py = tip.y;
+  const k = busy ? 0.22 : 0.3;
+  tip.x += (target.x - tip.x) * k;
+  tip.y += (target.y - tip.y) * k;
+  if (penDown && !busy) inkLine(px, py, tip.x, tip.y);
+  ang += ((tip.y > H * 0.6 ? -0.75 : 0.75) - ang) * 0.06;   // hand neeche ho to upar ki taraf aa jaye
+  drawScene(t);
+  requestAnimationFrame(tick);
+}
+
+/* ---------- robot hand ---------- */
+function limb(pts, w, fill) {
+  hctx.lineCap = 'round'; hctx.lineJoin = 'round';
+  hctx.beginPath(); pts.forEach((p, i) => i ? hctx.lineTo(p[0], p[1]) : hctx.moveTo(p[0], p[1]));
+  hctx.strokeStyle = '#1e2a3d'; hctx.lineWidth = w + 4; hctx.stroke();
+  hctx.strokeStyle = fill; hctx.lineWidth = w; hctx.stroke();
+  for (const p of pts.slice(1, -1)) {
+    hctx.beginPath(); hctx.arc(p[0], p[1], w * 0.3, 0, 7);
+    hctx.fillStyle = '#1e2a3d'; hctx.fill();
+    hctx.beginPath(); hctx.arc(p[0], p[1], w * 0.14, 0, 7);
+    hctx.fillStyle = ACCENT; hctx.fill();
+  }
+}
+
+function drawScene(t) {
+  hctx.clearRect(0, 0, W, H);
+
+  if (textPos && !busy && Math.floor(t * 2) % 2 === 0) {          // blinking cursor
+    hctx.fillStyle = ACCENT; hctx.fillRect(textPos.x - 1, textPos.y - 34, 2, 40);
+  }
+
+  const wob = penDown ? Math.sin(t * 38) * 0.6 : 0;
+  hctx.save();
+  hctx.translate(tip.x + wob, tip.y);
+  hctx.rotate(ang);
+  hctx.shadowColor = 'rgba(0,0,0,.55)';
+  hctx.shadowBlur = penDown ? 10 : 24;
+  hctx.shadowOffsetX = penDown ? 3 : 10; hctx.shadowOffsetY = penDown ? 6 : 18;
+
+  const metal = hctx.createLinearGradient(0, -40, 0, 40);
+  metal.addColorStop(0, '#f1f5fb'); metal.addColorStop(.5, '#a3b1c7'); metal.addColorStop(1, '#5d6c85');
+  const dark = hctx.createLinearGradient(0, -30, 0, 30);
+  dark.addColorStop(0, '#46546e'); dark.addColorStop(1, '#232d40');
+
+  // forearm
+  hctx.fillStyle = dark; hctx.fillRect(205, -30, 700, 60);
+  hctx.shadowColor = 'transparent';
+  hctx.strokeStyle = '#141c2b'; hctx.lineWidth = 3;
+  for (const x of [250, 330, 440]) { hctx.beginPath(); hctx.moveTo(x, -30); hctx.lineTo(x, 30); hctx.stroke(); }
+  hctx.fillStyle = '#7d8ca4'; hctx.fillRect(196, -35, 18, 70);
+
+  // palm
+  hctx.beginPath(); hctx.roundRect(135, -38, 70, 76, 16);
+  hctx.fillStyle = metal; hctx.fill(); hctx.strokeStyle = '#1e2a3d'; hctx.lineWidth = 3; hctx.stroke();
+  const glow = 0.6 + 0.4 * Math.sin(t * 3);
+  hctx.beginPath(); hctx.arc(172, 0, 8, 0, 7);
+  hctx.fillStyle = `rgba(53,224,255,${glow})`; hctx.shadowColor = ACCENT; hctx.shadowBlur = 16; hctx.fill();
+  hctx.shadowBlur = 0;
+
+  // curled fingers
+  limb([[170, -30], [144, -40], [130, -30]], 14, metal);
+  limb([[170, 30], [146, 40], [132, 30]], 14, metal);
+
+  // pen
+  hctx.lineCap = 'round';
+  hctx.strokeStyle = '#1e2a3d'; hctx.lineWidth = 11;
+  hctx.beginPath(); hctx.moveTo(14, 0); hctx.lineTo(112, 0); hctx.stroke();
+  hctx.strokeStyle = color; hctx.lineWidth = 7;
+  hctx.beginPath(); hctx.moveTo(14, 0); hctx.lineTo(112, 0); hctx.stroke();
+  hctx.strokeStyle = '#2b3550'; hctx.lineWidth = 5;
+  hctx.beginPath(); hctx.moveTo(0, 0); hctx.lineTo(16, 0); hctx.stroke();
+
+  // index finger + thumb (pen ko pakde hue)
+  limb([[142, -18], [110, -25], [84, -17], [66, -5]], 15, metal);
+  limb([[142, 18], [114, 25], [90, 15], [72, 4]], 15, metal);
+  hctx.restore();
+}
+
+/* ---------- mouse / touch draw ---------- */
+let down = false, moved = 0, startP = null;
+ink.addEventListener('pointerdown', e => {
+  if (busy) return;
+  ink.setPointerCapture(e.pointerId);
+  down = true; moved = 0; startP = { x: e.clientX, y: e.clientY };
+  tip.x = target.x = e.clientX; tip.y = target.y = e.clientY;
+  penDown = true;
+});
+ink.addEventListener('pointermove', e => {
+  if (busy) return;
+  if (down) moved += Math.abs(e.movementX || 0) + Math.abs(e.movementY || 0);
+  target = { x: e.clientX, y: e.clientY };
+});
+const lift = () => {
+  if (!down) return;
+  down = false; if (!busy) penDown = false;
+  if (moved < 6) { textPos = startP; txt.focus(); }               // sirf click: yahan likhna hai
+};
+ink.addEventListener('pointerup', lift);
+ink.addEventListener('pointercancel', lift);
+
+/* ---------- writing text ---------- */
+const frame = () => new Promise(r => requestAnimationFrame(r));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const arrive = async () => { while (Math.hypot(tip.x - target.x, tip.y - target.y) > 5) await frame(); };
+
+async function writeText(str) {
+  str = str.trim();
+  if (busy || !str) return;
+  busy = true; go.disabled = true; penDown = false;
+  const fs = Math.max(34, Math.min(64, W / 16));
+  const font = `600 ${fs}px Caveat, "Segoe Script", "Bradley Hand", cursive`;
+  try { await document.fonts.load(font); } catch (e) {}
+  if (!textPos) textPos = { x: Math.max(24, W * 0.07), y: H * 0.24 };
+  const x0 = Math.min(textPos.x, W - 100);
+  let x = x0, y = Math.min(textPos.y, H - 150);
+  ictx.font = font; ictx.fillStyle = color; ictx.textBaseline = 'alphabetic';
+
+  target = { x, y: y - fs * 0.2 };
+  await arrive();
+
+  for (const ch of str) {
+    const w = ictx.measureText(ch).width;
+    if (x + w > W - 30) {
+      penDown = false; x = x0; y += fs * 1.25;
+      if (y > H - 130) break;
+      target = { x, y: y - fs * 0.2 }; await arrive();
+    }
+    if (ch === ' ') { x += w; target = { x, y: y - fs * 0.2 }; await sleep(70); continue; }
+    penDown = true;
+    const dur = 170 + w * 6, t0 = performance.now();
+    for (;;) {
+      const p = Math.min(1, (performance.now() - t0) / dur);
+      target = { x: x + w * p, y: y - fs * 0.28 - Math.sin(p * Math.PI * 2.5) * fs * 0.16 };
+      ictx.save(); ictx.beginPath(); ictx.rect(x - 4, y - fs * 1.1, w * p + 6, fs * 1.6); ictx.clip();
+      ictx.fillText(ch, x, y); ictx.restore();
+      if (p >= 1) break;
+      await frame();
+    }
+    x += w;
+  }
+  penDown = false;
+  textPos = { x: x0, y: y + fs * 1.25 };
+  target = { x: Math.min(x + 60, W - 40), y: y + 30 };
+  await sleep(300);
+  busy = false; go.disabled = false;
+}
+
+function submit() { const s = txt.value; txt.value = ''; writeText(s); }
+go.onclick = submit;
+txt.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+document.getElementById('clr').onclick = () => {
+  ictx.clearRect(0, 0, W, H);
+  textPos = { x: Math.max(24, W * 0.07), y: H * 0.24 };
+};
+
+/* ---------- start ---------- */
+requestAnimationFrame(tick);
+document.fonts.ready.then(() => {
+  textPos = { x: Math.max(24, W * 0.07), y: H * 0.24 };
+  // setTimeout(() => writeText('Salam! Main aap ka robot hand hoon.'), 500);
+});
+</script>
+</body>
+</html>
